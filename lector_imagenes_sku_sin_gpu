@@ -1,0 +1,150 @@
+import os
+import cv2
+import pytesseract
+import easyocr
+import numpy as np
+from collections import Counter
+import time
+
+# -------------------------------
+# CONFIGURACIÓN
+# -------------------------------
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # ajusta si tu ruta es diferente
+reader = easyocr.Reader(['en', 'es'], gpu=False)  # 🔸 GPU deshabilitada (solo CPU)
+
+# -------------------------------
+# SOLICITAR CARPETA DE ORIGEN
+# -------------------------------
+carpeta_origen = input("📁 Ingresa la ruta de la carpeta con las imágenes: ").strip()
+
+if not os.path.isdir(carpeta_origen):
+    print(f"❌ La carpeta '{carpeta_origen}' no existe. Verifica la ruta e inténtalo de nuevo.")
+    exit(1)
+
+carpeta_destino = os.path.join(carpeta_origen, "procesadas")
+os.makedirs(carpeta_destino, exist_ok=True)
+
+# -------------------------------
+# FUNCIONES DE APOYO
+# -------------------------------
+def preprocesar_imagen(img):
+    """Aplica realce de contraste y reducción de ruido"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    smooth = cv2.bilateralFilter(enhanced, 9, 75, 75)
+    return smooth
+
+def aplicar_transformaciones(img):
+    """Genera variaciones de la imagen (rotaciones, escala, inversión)"""
+    transformaciones = [img]
+
+    # 🔧 Rotaciones válidas en OpenCV
+    transformaciones.append(cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE))
+    transformaciones.append(cv2.rotate(img, cv2.ROTATE_180))
+    transformaciones.append(cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE))
+
+    # 🔧 Escalado e inversión
+    transformaciones.append(cv2.resize(img, None, fx=1.5, fy=1.5))
+    transformaciones.append(cv2.bitwise_not(img))
+
+    return transformaciones
+
+def extraer_texto(img):
+    """Ejecuta OCR con EasyOCR y Tesseract, combinando resultados"""
+    textos = []
+    resultados_easy = reader.readtext(img, detail=1)
+    textos += [r[1] for r in resultados_easy]
+
+    texto_tess = pytesseract.image_to_string(img)
+    textos += texto_tess.splitlines()
+
+    textos_filtrados = [t.strip().replace(" ", "") for t in textos if t.strip()]
+    return textos_filtrados
+
+def extraer_sku(textos):
+    """Busca el SKU más probable usando heurística"""
+    candidatos = []
+    for t in textos:
+        if len(t) >= 5 and any(c.isdigit() for c in t):
+            candidatos.append(t)
+
+    if not candidatos:
+        return None
+
+    contador = Counter(candidatos)
+    return contador.most_common(1)[0][0]
+
+# -------------------------------
+# PROCESAMIENTO PRINCIPAL
+# -------------------------------
+if __name__ == "__main__":
+    start_time = time.time()
+    print("\n🚀 Iniciando procesamiento OCR sin GPU...\n")
+
+    archivos = sorted([f for f in os.listdir(carpeta_origen) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+    total = len(archivos)
+
+    if total == 0:
+        print("⚠️ No se encontraron imágenes en la carpeta especificada.")
+        exit(0)
+
+    print(f"📂 Imágenes encontradas: {total}")
+    skus_encontrados, skus_no_encontrados = [], []
+
+    for i in range(0, total, 2):  # procesa por pares
+        grupo = archivos[i:i+2]
+        if len(grupo) < 2:
+            print(f"⚠️ Imagen sin pareja: {grupo[0]}, se omitirá.")
+            continue
+
+        print(f"\n🔍 Procesando par: {grupo}")
+        imagenes = [cv2.imread(os.path.join(carpeta_origen, img)) for img in grupo]
+        textos_total = []
+
+        for img in imagenes:
+            if img is None:
+                continue
+            pre = preprocesar_imagen(img)
+            for t in aplicar_transformaciones(pre):
+                textos_total.extend(extraer_texto(t))
+
+        sku = extraer_sku(textos_total)
+
+        if sku:
+            print(f"✅ SKU detectado: {sku}")
+            skus_encontrados.append(sku)
+            destino = os.path.join(carpeta_destino, f"{sku}.jpg")
+
+            contador = 1
+            while os.path.exists(destino):
+                destino = os.path.join(carpeta_destino, f"{sku}_{contador}.jpg")
+                contador += 1
+
+            cv2.imwrite(destino, imagenes[0])
+        else:
+            print("❌ No se detectó SKU en este par.")
+            skus_no_encontrados.append(grupo)
+
+    # -------------------------------
+    # RESUMEN FINAL
+    # -------------------------------
+    exitos = len(skus_encontrados)
+    total_procesados = exitos + len(skus_no_encontrados)
+    tasa_exito = (exitos / total_procesados) * 100 if total_procesados > 0 else 0
+
+    print("\n📊 RESUMEN FINAL")
+    print("---------------------------")
+    print(f"🟢 SKUs encontrados: {exitos}")
+    print(f"🔴 No encontrados: {len(skus_no_encontrados)}")
+    print(f"📈 Tasa de éxito: {tasa_exito:.2f}%")
+    print(f"📂 Carpeta destino: {carpeta_destino}")
+    print(f"⏱ Tiempo total: {time.time() - start_time:.2f} segundos")
+    print("---------------------------")
+
+    if skus_no_encontrados:
+        print("\n⚠️ Archivos sin SKU:")
+        for grupo in skus_no_encontrados:
+            print("   -", grupo)
+
+    print("\n✅ Proceso completado.\n")
